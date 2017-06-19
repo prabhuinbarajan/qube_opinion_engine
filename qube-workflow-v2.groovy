@@ -57,6 +57,7 @@ node {
 
     String run_id = randomUUID() as String
     boolean supportFortify=false
+    boolean supportTwistlock = false
     sh (script:"docker create  -v /meta --name meta-${run_id} busybox")
 
     try {
@@ -149,9 +150,7 @@ node {
                     boolean optional = var.optional
                     String value = var.value
                     println(varName + ', ' + optional)
-                    if(varName == "supportFortify") {
-                        supportFortify = (value?.toLowerCase() == "true") 
-                    }
+ 
                     if (!optional && !value) {
                         error (String.format("Required variable(s) %s missing!", varName))
                     }
@@ -159,6 +158,9 @@ node {
                         projectVariables.put(varName, value)
                     }
                 }
+
+                supportTwistlock = projectVariables['supportTwistlock'] ?: false
+                supportFortify = projectVariables['supportFortify'] ?: false
 
                 // resolve all qubeship args in projectVariables
                 projectVariables = qubeship.resolveVariables(qubeshipUrl, tnt_guid, org_guid, project_id, projectVariables, qubeYamlString)
@@ -177,15 +179,18 @@ node {
                     }
                 }
                 if(supportFortify) {
-                    //sh (script:"docker pull qubeship/fortify:4.21")
                     wrap([$class: 'ConfigFileBuildWrapper', 
                     managedFiles: [
                         [fileId: 'fortify.license', 
                         targetLocation: "/tmp/${run_id}/fortify.license"]]]) {
-                        sh (script:"docker cp /tmp/${run_id}/fortify.license meta-${run_id}:/meta")
+                        //sh (script:"docker create --name fortify-${run_id} qubeship/fortify:4.21")
+                        sh (script:"docker cp /tmp/${run_id}/fortify.license fortify-${run_id}:/opt/fortify/")
+                        envVarsString+=" --volumes-from fortify-${run_id}"
                     }
-                    sh (script:"docker create --name fortify-${run_id} qubeship/fortify:4.21")
-                    envVarsString+=" --volumes-from fortify-${run_id}"
+                }
+                if (supportTwistlock) {
+                     sh (script: "docker create --name twistlock-${run_id} qubeship/twistlock:latest")
+                     envVarsString += " --volumes-from twistlock-${run_id}"
                 }
             }
             try {
@@ -239,7 +244,7 @@ def process(opinionList, toolchain, qubeConfig, qubeClient, envVarsString, toolc
             // If it doesn't exist
             containerId=container.id
             if(supportFortify) {
-                sh("docker exec ${container.id} sh -c \"cp /meta/fortify.license /opt/fortify\"")
+                //sh("docker exec ${container.id} sh -c \"cp /meta/fortify.license /opt/fortify\"")
                 sh("docker exec ${container.id} sh -c \"/opt/fortify/bin/fortify-install-maven-plugin.sh\"")
             }
             runStage(opinionList[0], toolchain, qubeConfig, qubeClient, container, workdir)
