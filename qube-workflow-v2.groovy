@@ -68,13 +68,13 @@ node {
         qubeship.inQubeshipTenancy(tnt_guid, org_guid, qubeshipUrl) { qubeClient ->
             stage("init") {
                 // load project
-                for (int i = 0; i < 3; i++) { 
+                for (int i = 0; i < 5; i++) { 
                     project = qubeApi(httpMethod: "GET", resource: "projects", id: "${project_id}", qubeClient: qubeClient)
                     if (project) {
                         break;
                     }
                     println("retrying.... ${project_id}")
-                    sleep(3000)
+                    sleep(10)
                 }
                 if (commithash?.trim().length() == 0) {
                     echo "replacing empty commit hash with refspec " + project.scm.refspec
@@ -154,6 +154,7 @@ node {
                 sh (returnStdout: true, script: "spruce merge --cherry-pick variables opinion.yaml qube.yaml qube_utils/merge_templates/variables.yaml > variables.yaml")
                 variableConfig = getConfig(env.WORKSPACE + "/variables.yaml")
                 Object[] vars = getArray(variableConfig.variables)
+                addLiteralProjectVariables(projectVariables, "QUBESHIP_RUN_ID", run_id )
 
                 for (int i = 0; i < vars?.length; i++) {
                     def var = vars[i];
@@ -171,6 +172,7 @@ node {
 
                 supportTwistlock = projectVariables['supportTwistlock']?.toBoolean() ?: false
                 supportFortify = projectVariables['supportFortify']?.toBoolean() ?: false
+                supportOpenshift = projectVariables['supportOpenshift']?.toBoolean() ?: false
 
                 // resolve all qubeship args in projectVariables
                 projectVariables = qubeship.resolveVariables(qubeshipUrl, tnt_guid, org_guid, project_id, projectVariables, qubeYamlString)
@@ -193,6 +195,9 @@ node {
                 }
                 if (supportTwistlock) {
                     servicesList << "twistlock"
+                }
+                if (supportTwistlock) {
+                    servicesList << "openshift"
                 }
             }
             try {
@@ -262,7 +267,7 @@ def process(int index, opinionList, toolchain, qubeConfig, qubeClient, envVarsSt
                     sh (script:"docker create --name ${run_id}-fortify qubeship/fortify:4.21")
                     sh (script:"docker cp /tmp/${run_id}/fortify.license ${run_id}-fortify:/opt/fortify/")
                     envVarsString+=" --volumes-from ${run_id}-fortify"
-                    preProcessCmdList<<"docker exec #container.id# sh -c \"/opt/fortify/bin/fortify-install-maven-plugin.sh\""                    
+                    preProcessCmdList<<"docker exec ##container.id## sh -c \"/opt/fortify/bin/fortify-install-maven-plugin.sh\""                    
                     println("calling next service")
                     processor.call()
                 }
@@ -283,7 +288,30 @@ def process(int index, opinionList, toolchain, qubeConfig, qubeClient, envVarsSt
                     envVarsString += " -e TWISTLOCK_UNAME=${USERNAME} -e TWISTLOCK_PWD=${PASSWORD}"
                     processor.call()
                 }
-            } else {
+            } else if (service == "openshift" && projectVariables["target_openshift_cluster"]) {
+                def openshiftEP = getQubeshipEntity(projectVariables["target_openshift_cluster"])
+                def openshiftEPURL = openshiftEP.endPoint
+                def openshiftProject = ""
+                def openshiftCredentialsPath=""
+
+                if(openshiftEP.credentialPath) {
+                    openshiftCredentialsPath = "qubeship:" + openshiftEP.category + ":" + openshiftEP.credentialPath
+                }
+                if (openshiftEP.additionalInfo) {
+                    openshiftProject = openshiftEP.additionalInfo['project']
+                }
+                withCredentials([string(credentialsId: openshiftCredentialsPath, variable: 'OPENSHIFT_TOKEN')]) {
+                    preProcessCmdList<<"docker cp /usr/bin/oc ##container.id##:/usr/bin"
+                    preProcessCmdList<<"docker exec ##container.id## sh -c \"oc login ${openshiftEPURL} --token=${env.OPENSHIFT_TOKEN}\""
+                    preProcessCmdList<<"docker exec ##container.id## sh -c \"oc project ${openshiftProject}\""           
+                    envVarsString += " -v /var/run/docker.sock:/var/run/docker.sock -e OPENSHIFT_URL=${openshiftEPURL} -e OPENSHIFT_TOKEN=${env.OPENSHIFT_TOKEN}"
+                    envVarsString += " -e OPENSHIFT_PROJECT=${openshiftProject}"
+                    addLiteralProjectVariables(projectVariables, "OPENSHIFT_PROJECT", openshiftProject )
+                    addLiteralProjectVariables(projectVariables, "OPENSHIFT_URL", openshiftEPURL )
+                    addLiteralProjectVariables(projectVariables, "OPENSHIFT_URL", env.OPENSHIFT_TOKEN )
+                    processor.call()
+                }
+            }else {
                 processor.call()
             }
         }
@@ -293,7 +321,6 @@ def process(int index, opinionList, toolchain, qubeConfig, qubeClient, envVarsSt
         action(opinionList, toolchain, qubeConfig, qubeClient, envVarsString, toolchainPrefix, run_id, getArray(preProcessCmdList)) 
     }
 }
-
 
 def processOpinion(opinionList, toolchain, qubeConfig, qubeClient, envVarsString, toolchainPrefix, run_id, preProcessCmdList) {
     def toolchain_prefix = (toolchainPrefix?:"qubeship") + "/"
@@ -306,8 +333,11 @@ def processOpinion(opinionList, toolchain, qubeConfig, qubeClient, envVarsString
     try {
         builderImage.withRun(envVarsString, "tail -f /dev/null") { container ->
             containerId=container.id
+            println(containerId)
             for (int i = 0; i < preProcessCmdList.length; i++) {  
-                String preprocessCommand = preProcessCmdList[i]?.replaceAll("#container.id#", "${container.id}")
+                //String preprocessCommand = preProcessCmdList[i]?.replaceAll(/##(.*)##/){ m -> "${" + ${m} +"}"}
+                String preprocessCommand = preProcessCmdList[i]?.replaceAll("##container.id##","${container.id}")
+                //String preprocessCommand = safeReplaceMacro(preProcessCmdList[i],/##(.*)##/)
                 println(preprocessCommand)
                 sh (preprocessCommand)
             }
@@ -348,6 +378,9 @@ def runStage(stageObj, toolchain, qubeConfig, qubeClient, container, workdir,run
         println("stage : " + stageObj.name + " : complete")
     }
 
+}
+def addLiteralProjectVariables(def projectVariables, def key, def value) {
+    projectVariables[key] = new SerializableTuple<ValueWrapper,Endpoint>(new StringValueWrapper(value), null);
 }
 
 def runTask(task, toolchain, qubeConfig, qubeClient, container=null, workdir=null, run_id=null) {
@@ -438,7 +471,7 @@ def runTask(task, toolchain, qubeConfig, qubeClient, container=null, workdir=nul
                     statusCode = sh (script: resolvedScriptStmt,returnStatus:true)
                     def imageId = readFile("/tmp/${run_id}-buildimage").trim().tokenize(':').last()
                     dynamicEnvVars["QUBESHIP_IMAGE_ID"] = imageId
-                    projectVariables["QUBESHIP_IMAGE_ID"] = new SerializableTuple<ValueWrapper,Endpoint>(new StringValueWrapper(imageId), null);
+                    addLiteralProjectVariables(projectVariables, "QUBESHIP_IMAGE_ID", imageId )
                 } else {
                     dynamicEnvVarsString=""
                     dynamicEnvVarsShellString = ""
@@ -536,6 +569,13 @@ def getYaml(yamlStr) {
     def yaml = new Yaml()
     qube_yaml = yaml.load(yamlStr)
     return qube_yaml
+}
+@NonCPS
+def safeReplaceMacro(str, expression ) {
+    str?.replaceAll( expression,
+                             { full, word -> evaluate("print $word") } )
+    //groovy.util.Eval.me(out).toString()
+    //return str?.replaceAll(expression){ m -> "${" + ${m} +"}"}
 }
 
 def getConfig(file) {
