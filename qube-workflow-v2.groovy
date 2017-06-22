@@ -154,7 +154,7 @@ node {
                 sh (returnStdout: true, script: "spruce merge --cherry-pick variables opinion.yaml qube.yaml qube_utils/merge_templates/variables.yaml > variables.yaml")
                 variableConfig = getConfig(env.WORKSPACE + "/variables.yaml")
                 Object[] vars = getArray(variableConfig.variables)
-                addLiteralProjectVariables(projectVariables, "QUBESHIP_RUN_ID", run_id )
+                projectVariables.put("QUBESHIP_RUN_ID", run_id )
 
                 for (int i = 0; i < vars?.length; i++) {
                     def var = vars[i];
@@ -245,7 +245,10 @@ node {
         }
     } finally {
         // signal: build end
-        sh (script: "docker rm -f \$(docker ps -aq --filter \"name=${run_id}-*\")")
+        containers_list = sh(returnStdout:true ,script: "docker ps -aq --filter \"name=${run_id}-*\" |tr '\n' ' '" )?.trim()
+        if (containers_list) {
+            sh (script: "docker rm -f ${containers_list}")
+        }
         pushPipelineEventMetrics(analyticsEndpoint, 'end', new Date())
     }
 }
@@ -289,6 +292,16 @@ def process(int index, opinionList, toolchain, qubeConfig, qubeClient, envVarsSt
                     processor.call()
                 }
             } else if (service == "openshift" && projectVariables["target_openshift_cluster"]) {
+                composeFile=getQubeshipValue(projectVariables["OPENSHIFT_DEPLOYMENT_COMPOSE_FILE"])
+                service=getQubeshipValue(projectVariables["OPENSHIFT_DEPLOYMENT_SERVICE"])
+                serviceImage=sh(returnStdout:true , script:"cat $composeFile | shyaml get-value services.${service}.image")?.trim()
+                if(serviceImage) {
+                    if(serviceImage != "%QUBESHIP_IMAGE%") {
+                        echo "WARNING: docker-compose is deploying a static image name. expected %QUBESHIP_IMAGE% - found ${serviceImage} .may  or may not match with qubeship generated image"
+                    }
+                }else {
+                    throw new Exception("ERROR: Invalid service ${service} in ${composeFile}. Unable to deploy to openshift")
+                }
                 def openshiftEP = getQubeshipEntity(projectVariables["target_openshift_cluster"])
                 def openshiftEPURL = openshiftEP.endPoint
                 def openshiftProject = ""
@@ -302,13 +315,13 @@ def process(int index, opinionList, toolchain, qubeConfig, qubeClient, envVarsSt
                 }
                 withCredentials([string(credentialsId: openshiftCredentialsPath, variable: 'OPENSHIFT_TOKEN')]) {
                     preProcessCmdList<<"docker cp /usr/bin/oc ##container.id##:/usr/bin"
-                    preProcessCmdList<<"docker exec ##container.id## sh -c \"oc login ${openshiftEPURL} --token=${env.OPENSHIFT_TOKEN}\""
-                    preProcessCmdList<<"docker exec ##container.id## sh -c \"oc project ${openshiftProject}\""           
-                    envVarsString += " -v /var/run/docker.sock:/var/run/docker.sock -e OPENSHIFT_URL=${openshiftEPURL} -e OPENSHIFT_TOKEN=${env.OPENSHIFT_TOKEN}"
+                    preProcessCmdList<<"docker cp /usr/bin/kompose ##container.id##:/usr/bin"
+
+                    preProcessCmdList<<"oc login ${openshiftEPURL} --token=${env.OPENSHIFT_TOKEN}"
+                    preProcessCmdList<<"oc project ${openshiftProject}"
+                    envVarsString += " -v /var/run/docker.sock:/var/run/docker.sock -e OPENSHIFT_URL=${openshiftEPURL} -e OPENSHIFT_TOKEN=${env.OPENSHIFT_TOKEN} -e OPENSHIFT_PROJECT=${openshiftProject}"
                     envVarsString += " -e OPENSHIFT_PROJECT=${openshiftProject}"
                     addLiteralProjectVariables(projectVariables, "OPENSHIFT_PROJECT", openshiftProject )
-                    addLiteralProjectVariables(projectVariables, "OPENSHIFT_URL", openshiftEPURL )
-                    addLiteralProjectVariables(projectVariables, "OPENSHIFT_URL", env.OPENSHIFT_TOKEN )
                     processor.call()
                 }
             }else {
@@ -626,6 +639,17 @@ def getQubeshipEntity(result) {
     Object entity = net.sf.json.JSONObject.fromObject(result.getFirst().getValue())
     //def entity = slurper.parseText(result.getFirst().getValue())
     return entity
+}
+
+
+def getQubeshipValue(result) {
+    if(!result) {
+        throw new Exception("Result is null. cannot convert to qubeship entity")
+    }
+    if(!result.getFirst().getType() in String) {
+        throw new Exception("$result is not of type String. cannot convert to qubeship value literal")
+    }
+    result.getFirst().getValue()
 }
 
 def pushPipelineEventMetrics(analyticsEndpoint, eventType, Date timestamp) {
